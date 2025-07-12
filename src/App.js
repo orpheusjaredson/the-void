@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { db } from "./firebase";
-import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp } from "firebase/firestore";
+import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, deleteDoc, doc } from "firebase/firestore";
 
 function seededRandom(seed) {
   let x = Math.sin(seed) * 10000;
@@ -25,12 +25,32 @@ export default function App() {
   const [viewport, setViewport] = useState({ width: window.innerWidth, height: window.innerHeight });
   const [scattered, setScattered] = useState([]); // Scattered messages for the void
   const [cameraOffset, setCameraOffset] = useState(0); // Virtual camera offset
+  const [messageArrivalTimes, setMessageArrivalTimes] = useState({}); // Track when each message was first seen
+  const sessionStartRef = useRef(Date.now()); // Track when the user opened the site
+  const [scatterTimes, setScatterTimes] = useState({}); // Track when each message should become scattered
   const prevWidthRef = useRef(window.innerWidth);
   const animationRef = useRef();
   const containerRef = useRef();
   const SCATTER_HEIGHT = viewport.height * 10; // Tall virtual area
   const SPAWN_COUNT = 40; // Number of times to spawn each message
   const ANIMATION_SPEED = 60; // px/sec
+  const MESSAGE_DELAY = 2000; // ms (2 seconds)
+  // Remove pendingDeleteIds state and all related effects
+
+  function estimateTextHeight(text) {
+    const words = text.split(' ');
+    const lines = Math.ceil(words.length / 8);
+    return lines * fontSize * 16 * 1.2;
+  }
+  function isOverlapping(a, b) {
+    const cushion = 40; // px safe cushion around each message
+    return (
+      a.x - cushion < b.x + b.width + cushion &&
+      a.x + a.width + cushion > b.x - cushion &&
+      a.y - cushion < b.y + b.height + cushion &&
+      a.y + a.height + cushion > b.y - cushion
+    );
+  }
 
   // Firestore listener
   useEffect(() => {
@@ -41,32 +61,31 @@ export default function App() {
         msgs.push({ id: doc.id, ...doc.data() });
       });
       setMessages(msgs);
+      // Track arrival times for new messages
+      setMessageArrivalTimes((prev) => {
+        const now = Date.now();
+        const updated = { ...prev };
+        msgs.forEach((msg) => {
+          if (!updated[msg.id]) {
+            updated[msg.id] = now;
+          }
+        });
+        // Clean up old message IDs
+        Object.keys(updated).forEach((id) => {
+          if (!msgs.find((m) => m.id === id)) {
+            delete updated[id];
+          }
+        });
+        return updated;
+      });
     });
     return unsubscribe;
   }, []);
 
-  // Update viewport size on resize
+  // Update viewport size on resize and re-scatter messages
   useEffect(() => {
     const handleResize = () => {
-      setViewport((prev) => {
-        const newWidth = window.innerWidth;
-        const oldWidth = prevWidthRef.current;
-        setScattered((floaters) =>
-          floaters.map((f) => {
-            // Calculate ratio of previous X position
-            const ratio = oldWidth > f.width ? f.x / (oldWidth - f.width) : 0;
-            const newMsgWidth = Math.min(f.width, 0.6 * newWidth, 340);
-            const newX = ratio * (newWidth - newMsgWidth);
-            return {
-              ...f,
-              x: Math.max(0, Math.min(newX, newWidth - newMsgWidth)),
-              width: newMsgWidth,
-            };
-          })
-        );
-        prevWidthRef.current = newWidth;
-        return { width: newWidth, height: window.innerHeight };
-      });
+      setViewport({ width: window.innerWidth, height: window.innerHeight });
     };
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
@@ -75,38 +94,56 @@ export default function App() {
   // Scatter messages in a tall area
   useEffect(() => {
     if (!messages.length) return;
-    const minFontSize = 1.0;
-    const maxFontSize = 2.0;
-    const maxWidth = Math.min(0.6 * viewport.width, 340);
+    const fontSize = 1.3; // Fixed font size for all messages
+    const maxWidth = 260; // Fixed width for all messages
     const placed = [];
     let nextId = 0;
-    function estimateTextHeight(text, fontSize) {
-      const charsPerLine = Math.floor(maxWidth / (fontSize * 16));
-      const lines = Math.ceil(text.length / charsPerLine);
+    function estimateTextHeight(text) {
+      const words = text.split(' ');
+      const lines = Math.ceil(words.length / 8);
       return lines * fontSize * 16 * 1.2;
     }
-    for (let spawn = 0; spawn < SPAWN_COUNT; spawn++) {
-      messages.forEach((msg, idx) => {
-        const baseSeed = getSeed(msg.id || "" + idx) + spawn * 100000;
-        const fontSize = 1.0 + seededRandom(baseSeed + 2) * (maxFontSize - minFontSize);
-        const width = maxWidth;
-        const height = estimateTextHeight(msg.text, fontSize);
-        const x = seededRandom(baseSeed) * (viewport.width - width);
-        const y = seededRandom(baseSeed + 100) * (SCATTER_HEIGHT - height);
-        placed.push({
-          id: `scattered-${nextId++}`,
-          text: msg.text,
-          x,
-          y,
-          fontSize,
-          width,
-          height,
-        });
-      });
+    function isOverlapping(a, b) {
+      const cushion = 40; // px safe cushion around each message
+      return (
+        a.x - cushion < b.x + b.width + cushion &&
+        a.x + a.width + cushion > b.x - cushion &&
+        a.y - cushion < b.y + b.height + cushion &&
+        a.y + a.height + cushion > b.y - cushion
+      );
+    }
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const height = estimateTextHeight(msg.text);
+      const width = maxWidth;
+      for (let spawn = 0; spawn < SPAWN_COUNT; spawn++) {
+        const baseSeed = getSeed(msg.text) + spawn * 100000;
+        let x, y, tries = 0, overlap;
+        do {
+          const trySeed = baseSeed + tries * 1000;
+          x = seededRandom(trySeed) * (viewport.width - width);
+          y = seededRandom(trySeed + 100) * (SCATTER_HEIGHT - height);
+          const candidate = { x, y, width, height };
+          overlap = placed.some(other => isOverlapping(candidate, other));
+          tries++;
+        } while (overlap && tries < 50);
+        // Only render if in the visible void
+        if (y + height > 0 && y < SCATTER_HEIGHT) {
+          placed.push({
+            id: `scattered-${nextId++}`,
+            text: msg.text,
+            x,
+            y,
+            fontSize,
+            width,
+            height,
+          });
+        }
+      }
     }
     setScattered(placed);
     // eslint-disable-next-line
-  }, [messages, viewport.width, viewport.height]);
+  }, [messages, viewport.width, viewport.height, cameraOffset, messageArrivalTimes]);
 
   // Animation: cameraOffset increases over time
   useEffect(() => {
@@ -163,8 +200,41 @@ export default function App() {
     return y + msg.height > 0 && y < viewport.height;
   });
 
+  function splitIntoBalancedLines(text, targetLength = 48) {
+    const words = text.split(' ');
+    const lines = [];
+    let currentLine = '';
+    for (let word of words) {
+      if ((currentLine + ' ' + word).trim().length > targetLength && currentLine.length > 0) {
+        lines.push(currentLine.trim());
+        currentLine = word;
+      } else {
+        currentLine += ' ' + word;
+      }
+    }
+    if (currentLine.trim().length > 0) lines.push(currentLine.trim());
+    return lines;
+  }
+
   return (
     <div className="flex flex-col h-screen bg-black text-white">
+      {/* Bold centered title at the top */}
+      <div
+        style={{
+          width: "100%",
+          textAlign: "center",
+          fontWeight: "bold",
+          fontSize: "2.5rem",
+          letterSpacing: "0.2em",
+          padding: "1.2rem 0 0.5rem 0",
+          position: "sticky",
+          top: 0,
+          zIndex: 30,
+          background: "rgba(0,0,0,0.85)",
+        }}
+      >
+        THE VOID
+      </div>
       <div
         ref={containerRef}
         className="flex-1 relative"
@@ -178,10 +248,15 @@ export default function App() {
         }}
         tabIndex={0}
       >
+        {/* Message rendering code follows */}
         {visibleMessages.map((msg) => {
           let y = msg.y - wrappedCameraOffset;
           if (y < -msg.height) y += SCATTER_HEIGHT;
           if (y > SCATTER_HEIGHT - msg.height) y -= SCATTER_HEIGHT;
+
+          // Split message into visually balanced lines by character count
+          const lines = splitIntoBalancedLines(msg.text, 48);
+
           return (
             <div
               key={msg.id}
@@ -201,7 +276,12 @@ export default function App() {
                 transition: "none",
               }}
             >
-              {msg.text}
+              {lines.map((line, idx) => (
+                <span key={idx}>
+                  {line}
+                  {idx < lines.length - 1 && <br />}
+                </span>
+              ))}
             </div>
           );
         })}
@@ -217,12 +297,12 @@ export default function App() {
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Send a message into the void..."
+          placeholder="Speak into the void..."
           autoFocus
         />
         <button
           type="submit"
-          className="ml-3 px-4 py-2 bg-white text-black rounded hover:bg-gray-200 transition"
+          className="ml-3 px-4 py-2 border-2 border-white bg-black text-white rounded transition hover:bg-white hover:text-black"
         >
           Send
         </button>
